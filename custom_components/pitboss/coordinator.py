@@ -17,6 +17,7 @@ class PitBossDataUpdateCoordinator(DataUpdateCoordinator[StateDict]):
     config_entry: ConfigEntry
     device_info: DeviceInfo
     api: PitBoss
+    firmware_version: str | None = None
 
     def __init__(
         self,
@@ -36,6 +37,12 @@ class PitBossDataUpdateCoordinator(DataUpdateCoordinator[StateDict]):
         """Set up the coordinator."""
         await self.api.subscribe_state(self._on_state_update)
         await self._start_api()
+        try:
+            result = await self.api.get_firmware_version()
+            self.firmware_version = result.get("firmwareVersion")
+        except Exception as ex:  # pylint: disable=broad-exception-caught
+            # Firmware version is non-critical; don't fail setup over it.
+            self.logger.debug("Could not fetch firmware version: %s", ex)
 
     async def _on_state_update(self, data: StateDict) -> None:
         self.logger.debug("Received data: %s", data)
