@@ -97,7 +97,44 @@ async def async_setup_entry(
             )
     if coordinator.firmware_version:
         entities.append(FirmwareSensor(coordinator, entry.unique_id))
+    entities.append(SmokerTempSensor(coordinator, entry.unique_id))
     async_add_devices(entities)
+
+
+class SmokerTempSensor(BaseEntity, SensorEntity):
+    """Current temperature of the smoker chamber (separate from grill temp)."""
+
+    _attr_device_class = SensorDeviceClass.TEMPERATURE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:thermometer"
+
+    def __init__(
+        self,
+        coordinator: PitBossDataUpdateCoordinator,
+        entry_unique_id: str,
+    ) -> None:
+        super().__init__(coordinator, entry_unique_id)
+        self._attr_unique_id = f"smoker_temp_{entry_unique_id}"
+        self._attr_name = "Smoker temperature"
+
+    @property
+    def native_unit_of_measurement(self) -> str | None:
+        """Return the unit of measurement, respecting user preferences."""
+        unit_option = self.coordinator.config_entry.options.get(CONF_TEMPERATURE_UNIT)
+        if unit_option == TEMPERATURE_UNIT_FAHRENHEIT:
+            return UnitOfTemperature.FAHRENHEIT
+        if unit_option == TEMPERATURE_UNIT_CELSIUS:
+            return UnitOfTemperature.CELSIUS
+        if data := self.coordinator.data:
+            if not data.get("isFahrenheit"):
+                return UnitOfTemperature.CELSIUS
+        return UnitOfTemperature.FAHRENHEIT
+
+    @property
+    def native_value(self) -> int | None:
+        if data := self.coordinator.data:
+            return data.get("smokerActTemp")
+        return None
 
 
 class FirmwareSensor(BaseEntity, SensorEntity):
