@@ -4,6 +4,7 @@ from unittest.mock import Mock
 import pytest
 from conftest import get_entity
 from homeassistant.core import HomeAssistant
+from homeassistant.util.unit_system import METRIC_SYSTEM
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.pitboss.const import DOMAIN
@@ -12,13 +13,14 @@ from custom_components.pitboss.number import TargetProbeTemperature
 
 
 @pytest.mark.parametrize("model", ["PBV4PS2"])
-async def test_only_probe_1_entity_created(
+async def test_target_for_every_probe(
     hass: HomeAssistant,
     mock_add_config_entry: Callable[[], Awaitable[MockConfigEntry]],
 ) -> None:
+    """One target per probe, whether or not the board can hold it."""
     await mock_add_config_entry()
     assert hass.states.get("number.mygrill_mpc_target") is not None
-    assert hass.states.get("number.mygrill_mp1_target") is None
+    assert hass.states.get("number.mygrill_mp1_target") is not None
 
 
 @pytest.mark.parametrize("model", ["PB1150PS3"])
@@ -33,13 +35,15 @@ async def test_both_probe_entities_created(
 
 
 @pytest.mark.parametrize("model", ["PB2180LK"])
-async def test_no_probe_entities_created(
+async def test_targets_exist_without_any_board_command(
     hass: HomeAssistant,
     mock_add_config_entry: Callable[[], Awaitable[MockConfigEntry]],
 ) -> None:
+    """This board declares no probe command at all; all four use the scratchpad."""
     await mock_add_config_entry()
-    assert hass.states.get("number.mygrill_probe_1_target") is None
-    assert hass.states.get("number.mygrill_probe_2_target") is None
+    for probe_number in range(1, 5):
+        entity_id = f"number.mygrill_probe_{probe_number}_target"
+        assert hass.states.get(entity_id) is not None, entity_id
 
 
 @pytest.mark.parametrize("model", ["PBV4PS2"])
@@ -102,3 +106,73 @@ async def test_native_value_none_without_data(
         hass, "number", "number.mygrill_mpc_target", TargetProbeTemperature
     )
     assert entity.native_value is None
+
+
+@pytest.mark.parametrize("model", ["PB2180LK"])
+async def test_target_without_a_board_command_goes_to_the_scratchpad(
+    hass: HomeAssistant,
+    mock_add_config_entry: Callable[[], Awaitable[MockConfigEntry]],
+    mock_pitboss: Mock,
+) -> None:
+    entry = await mock_add_config_entry()
+    coordinator: PitBossDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
+    coordinator.async_set_updated_data(
+        {"moduleIsOn": True, "isFahrenheit": True, "p3Temp": 70}
+    )
+    await hass.async_block_till_done()
+
+    await hass.services.async_call(
+        "number",
+        "set_value",
+        {"entity_id": "number.mygrill_probe_3_target", "value": 165},
+        blocking=True,
+    )
+    mock_pitboss.set_virtual_data.assert_awaited_once_with({"p3T": 165})
+
+
+@pytest.mark.parametrize("model", ["PB2180LK"])
+async def test_a_target_set_from_the_app_is_read_back(
+    hass: HomeAssistant,
+    mock_add_config_entry: Callable[[], Awaitable[MockConfigEntry]],
+    mock_pitboss: Mock,
+) -> None:
+    """The scratchpad is how a target set on the phone reaches us."""
+    entry = await mock_add_config_entry()
+    coordinator: PitBossDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
+    # The fixture resets get_state during setup, so set these afterwards.
+    mock_pitboss.get_virtual_data.return_value = {"p3T": 165}
+    mock_pitboss.get_state.return_value = {
+        "moduleIsOn": True,
+        "isFahrenheit": True,
+        "p3Temp": 70,
+    }
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    state = hass.states.get("number.mygrill_probe_3_target")
+    assert state is not None
+    assert state.state == "165"
+
+
+@pytest.mark.parametrize("units", [METRIC_SYSTEM])
+@pytest.mark.parametrize("model", ["PB2180LK"])
+async def test_scratchpad_values_are_fahrenheit(
+    hass: HomeAssistant,
+    mock_add_config_entry: Callable[[], Awaitable[MockConfigEntry]],
+    mock_pitboss: Mock,
+) -> None:
+    """It always holds fahrenheit, whatever unit the grill is working in."""
+    entry = await mock_add_config_entry()
+    coordinator: PitBossDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
+    coordinator.async_set_updated_data(
+        {"moduleIsOn": True, "isFahrenheit": False, "p3Temp": 20}
+    )
+    await hass.async_block_till_done()
+
+    await hass.services.async_call(
+        "number",
+        "set_value",
+        {"entity_id": "number.mygrill_probe_3_target", "value": 74},
+        blocking=True,
+    )
+    mock_pitboss.set_virtual_data.assert_awaited_once_with({"p3T": 165})

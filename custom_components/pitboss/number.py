@@ -1,6 +1,5 @@
 """Number platform for pitboss."""
 
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Literal
 
@@ -11,7 +10,6 @@ from homeassistant.const import UnitOfTemperature
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.util.unit_conversion import TemperatureConverter
-from pytboss.api import PitBoss
 
 from .const import (
     DEFAULT_PROBE_CELSIUS_STEP,
@@ -27,27 +25,21 @@ from .entity import BaseEntity
 
 @dataclass(frozen=True, kw_only=True)
 class PitBossNumberEntityDescription(NumberEntityDescription):
-    key: Literal["p1Target", "p2Target"]
-    probe_number: Literal[1, 2]
-    set_fn: Callable[[PitBoss], Callable[[int], Awaitable[dict]]]
+    key: Literal["p1Target", "p2Target", "p3Target", "p4Target"]
+    probe_number: Literal[1, 2, 3, 4]
     device_class: NumberDeviceClass = NumberDeviceClass.TEMPERATURE
     icon: str = "mdi:thermometer"
-    matching_probe_key: Literal["p1Temp", "p2Temp"]
+    matching_probe_key: Literal["p1Temp", "p2Temp", "p3Temp", "p4Temp"]
 
 
-PROBE_1_DESCRIPTION = PitBossNumberEntityDescription(
-    key="p1Target",
-    name="Probe 1 Target",
-    probe_number=1,
-    set_fn=lambda api: api.set_probe_temperature,
-    matching_probe_key="p1Temp",
-)
-PROBE_2_DESCRIPTION = PitBossNumberEntityDescription(
-    key="p2Target",
-    name="Probe 2 Target",
-    probe_number=2,
-    set_fn=lambda api: api.set_probe_2_temperature,
-    matching_probe_key="p2Temp",
+PROBE_DESCRIPTIONS = tuple(
+    PitBossNumberEntityDescription(
+        key=f"p{n}Target",  # type: ignore[arg-type]
+        name=f"Probe {n} Target",
+        probe_number=n,  # type: ignore[arg-type]
+        matching_probe_key=f"p{n}Temp",  # type: ignore[arg-type]
+    )
+    for n in (1, 2, 3, 4)
 )
 
 
@@ -57,17 +49,12 @@ async def async_setup_entry(
     """Setup number platformm."""
     coordinator: PitBossDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
     assert entry.unique_id is not None
-    entities: list[TargetProbeTemperature] = []
-    if "set-probe-1-temperature" in (
-        available_commands := coordinator.api.spec.control_board.commands
-    ):
-        entities.append(
-            TargetProbeTemperature(coordinator, entry.unique_id, PROBE_1_DESCRIPTION)
-        )
-    if "set-probe-2-temperature" in available_commands:
-        entities.append(
-            TargetProbeTemperature(coordinator, entry.unique_id, PROBE_2_DESCRIPTION)
-        )
+    probe_count = coordinator.api.spec.meat_probes or 0
+    entities = [
+        TargetProbeTemperature(coordinator, entry.unique_id, description)
+        for description in PROBE_DESCRIPTIONS
+        if description.probe_number <= probe_count
+    ]
     if entities:
         async_add_devices(entities)
 
@@ -114,13 +101,14 @@ class TargetProbeTemperature(BaseEntity, NumberEntity):
     @property
     def native_value(self) -> int | None:
         """Return the native value of the probe target."""
-        if data := self.coordinator.data:
-            return data.get(self.entity_description.key)
-        return None
+        return self.coordinator.probe_target(self.entity_description.probe_number)
 
     async def async_set_native_value(self, value: float) -> None:
         """Set new value."""
-        await self.entity_description.set_fn(self.coordinator.api)(int(value))
+        await self.coordinator.async_set_probe_target(
+            self.entity_description.probe_number, int(value)
+        )
+        self.coordinator.async_update_listeners()
 
     @property
     def native_min_value(self) -> float:

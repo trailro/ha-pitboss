@@ -34,6 +34,14 @@ class PitBossDataUpdateCoordinator(DataUpdateCoordinator[StateDict]):
         self.device_info = device_info
         self.api = api
         self._api_started = False
+        # Targets for probes the control board cannot hold. Kept here so they
+        # survive the grill being off, when the scratchpad below is wiped.
+        self.probe_targets: dict[int, int] = {}
+        # The grill's scratchpad. The official app stores the targets the
+        # board has no command for in here, so reading it is how a target set
+        # from the phone shows up. Always Fahrenheit.
+        self.virtual_data: dict = {}
+        self._vdata_seeded = False
 
     def accepted_setpoints(self, unit: str) -> list[float]:
         """Grill setpoints the control board honours, expressed in `unit`.
@@ -60,6 +68,113 @@ class PitBossDataUpdateCoordinator(DataUpdateCoordinator[StateDict]):
         exists on pytboss newer than the pinned 2026.8.1.
         """
         return bool(self.api.spec.json.get("has_mpc"))
+
+    def probe_command(self, probe_number: int) -> str | None:
+        """The board command that sets this probe's target, if it has one.
+
+        Only probes 1 and 2 ever have one, and only on some boards: across
+        the whole vendor database no board declares a command for probe 3 or
+        4. Where there is none, the target lives in the scratchpad instead.
+        """
+        slug = f"set-probe-{probe_number}-temperature"
+        if slug in self.api.spec.control_board.commands:
+            return slug
+        return None
+
+    def probe_target(self, probe_number: int) -> int | None:
+        """The target set for a probe, in the grill's own unit.
+
+        Three sources, most authoritative first: what the board reports, what
+        the scratchpad holds -- which is how a target set from the phone app
+        appears here -- and finally the last value we sent, which is all that
+        is left while the grill is off and the scratchpad is empty.
+        """
+        if (data := self.data) and (
+            reported := data.get(f"p{probe_number}Target")
+        ) is not None:
+            return int(reported)  # type: ignore[call-overload]
+        if (raw := self.virtual_data.get(f"p{probe_number}T")) is not None:
+            return self._from_fahrenheit(raw)
+        return self.probe_targets.get(probe_number)
+
+    def _grill_is_fahrenheit(self) -> bool:
+        return bool(self.data and self.data.get("isFahrenheit"))
+
+    def _from_fahrenheit(self, value: float) -> int:
+        if self._grill_is_fahrenheit():
+            return int(value)
+        return floor((value - 32) / 1.8)
+
+    def _to_fahrenheit(self, value: int) -> int:
+        if self._grill_is_fahrenheit():
+            return value
+        return round(value * 1.8 + 32)
+
+    async def async_set_probe_target(self, probe_number: int, temp: int) -> None:
+        """Set a probe's target, by whichever route this probe supports."""
+        if self.probe_command(probe_number):
+            setter = (
+                self.api.set_probe_temperature
+                if probe_number == 1
+                else self.api.set_probe_2_temperature
+            )
+            await setter(temp)
+        elif self.data and self.data.get("moduleIsOn"):
+            # The scratchpad only accepts writes while the grill is on; when
+            # it is off the value stays with us and is pushed at power-on.
+            await self._async_write_virtual_data(
+                {f"p{probe_number}T": self._to_fahrenheit(temp)}
+            )
+        self.probe_targets[probe_number] = temp
+
+    async def _async_write_virtual_data(self, updates: dict) -> None:
+        """Merge `updates` into the scratchpad.
+
+        The firmware assigns the payload wholesale, so anything not sent back
+        is lost; the official app merges client-side for the same reason.
+        """
+        payload = {k: v for k, v in self.virtual_data.items() if k != "psw"}
+        payload.update(updates)
+        await self.api.set_virtual_data(payload)
+        self.virtual_data = payload
+
+    async def _async_refresh_virtual_data(self, state: StateDict) -> None:
+        """Track the scratchpad. Never fatal."""
+        if not state.get("moduleIsOn"):
+            # The firmware clears it on every status frame while off.
+            self.virtual_data = {}
+            self._vdata_seeded = False
+            return
+        try:
+            data = await self.api.get_virtual_data()
+        except Exception as ex:  # noqa: BLE001
+            self.logger.debug("Could not read the scratchpad: %s", ex)
+            return
+        self.virtual_data = data if isinstance(data, dict) else {}
+        # Adopt whatever it holds, so a target set from the phone survives the
+        # grill being switched off and the scratchpad being wiped.
+        for probe_number in range(1, 5):
+            if self.probe_command(probe_number):
+                continue
+            if (raw := self.virtual_data.get(f"p{probe_number}T")) is not None:
+                self.probe_targets[probe_number] = self._from_fahrenheit(raw)
+        if self._vdata_seeded:
+            return
+        self._vdata_seeded = True
+        # It came on with an empty scratchpad: hand it what we are holding so
+        # the phone app sees the same targets. Anything already there was set
+        # from the app and wins.
+        updates = {
+            f"p{n}T": self._to_fahrenheit(temp)
+            for n, temp in self.probe_targets.items()
+            if not self.probe_command(n) and f"p{n}T" not in self.virtual_data
+        }
+        if not updates:
+            return
+        try:
+            await self._async_write_virtual_data(updates)
+        except Exception as ex:  # noqa: BLE001
+            self.logger.debug("Could not seed the scratchpad: %s", ex)
 
     async def _async_setup(self) -> None:
         """Set up the coordinator."""
@@ -117,7 +232,9 @@ class PitBossDataUpdateCoordinator(DataUpdateCoordinator[StateDict]):
         # Relying solely on push notifications means sensors can go stale after
         # a reconnect if push notifications stop being delivered.
         try:
-            return self._merge_state(await self.api.get_state())
+            merged = self._merge_state(await self.api.get_state())
+            await self._async_refresh_virtual_data(merged)
+            return merged
         except NotConnectedError as ex:
             raise UpdateFailed("Grill not connected") from ex
         except RPCError as ex:
