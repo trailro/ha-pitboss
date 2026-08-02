@@ -128,4 +128,7 @@ def mock_pitboss(spec: Grill) -> Generator[Mock]:
         # know about them.
         api.config = Mock()
         api.config.get_info = AsyncMock(return_value={})
+        # autospec gives these a Mock return value; the scratchpad is a dict.
+        api.get_virtual_data = AsyncMock(return_value={})
+        api.set_virtual_data = AsyncMock(return_value={})
         yield api
