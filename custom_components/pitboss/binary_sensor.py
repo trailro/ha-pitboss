@@ -121,10 +121,15 @@ async def async_setup_entry(
 ):
     """Setup binary_sensor platform."""
     coordinator: PitBossDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
-    entities: list[BinarySensor] = []
+    entities: list[BinarySensorEntity] = []
     assert entry.unique_id is not None
     for entity_description in ENTITY_DESCRIPTIONS:
         entities.append(BinarySensor(coordinator, entry.unique_id, entity_description))
+    probe_count = coordinator.api.spec.meat_probes or 0
+    for probe_number in range(1, probe_count + 1):
+        entities.append(
+            ProbeTargetReachedSensor(coordinator, entry.unique_id, probe_number)
+        )
     async_add_entities(entities)
 
 
@@ -153,3 +158,41 @@ class BinarySensor(BaseEntity, BinarySensorEntity):
         if data := self.coordinator.data:
             return data.get(self.entity_description.key)
         return None
+
+
+class ProbeTargetReachedSensor(BaseEntity, BinarySensorEntity):
+    """Whether a probe has reached the target set for it.
+
+    The grill acts on its control probe by itself, dropping the setpoint once
+    that target is hit, but it does nothing with the others. This gives every
+    probe the same signal to automate on.
+    """
+
+    _attr_icon = "mdi:thermometer-check"
+
+    def __init__(
+        self,
+        coordinator: PitBossDataUpdateCoordinator,
+        entry_unique_id: str,
+        probe_number: int,
+    ) -> None:
+        super().__init__(coordinator, entry_unique_id)
+        self.probe_number = probe_number
+        self._attr_unique_id = f"probe{probe_number}_target_reached_{entry_unique_id}"
+        label = probe_label(coordinator.has_mpc, probe_number)
+        self._attr_name = f"{label} target reached"
+
+    @property
+    def is_on(self) -> bool:
+        """Whether the probe is at or above its target.
+
+        Reports off rather than unknown when there is no probe or no target:
+        an automation triggering on off -> on never fires reliably out of an
+        unknown state, and "not reached" is true either way.
+        """
+        data = self.coordinator.data or {}
+        temperature = data.get(f"p{self.probe_number}Temp")
+        target = self.coordinator.probe_target(self.probe_number)
+        if temperature is None or target is None:
+            return False
+        return int(temperature) >= target  # type: ignore[call-overload]

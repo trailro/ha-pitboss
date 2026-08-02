@@ -80,3 +80,39 @@ async def test_fan_and_igniter_report_their_state(
     assert igniter is not None
     assert fan.state == "on"
     assert igniter.state == "off"
+
+
+async def test_target_reached_flips_when_the_probe_gets_there(
+    hass: HomeAssistant,
+    mock_add_config_entry: Callable[[], Awaitable[MockConfigEntry]],
+) -> None:
+    entry = await mock_add_config_entry()
+    coordinator: PitBossDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
+    coordinator.probe_targets[1] = 165
+
+    coordinator.async_set_updated_data({"p1Temp": 150})
+    await hass.async_block_till_done()
+    state = hass.states.get(_entity_id("MPC target reached"))
+    assert state is not None
+    assert state.state == "off"
+
+    coordinator.async_set_updated_data({"p1Temp": 165})
+    await hass.async_block_till_done()
+    state = hass.states.get(_entity_id("MPC target reached"))
+    assert state is not None
+    assert state.state == "on"
+
+
+async def test_target_reached_is_off_rather_than_unknown(
+    hass: HomeAssistant,
+    mock_add_config_entry: Callable[[], Awaitable[MockConfigEntry]],
+) -> None:
+    """No probe and no target still means the target is not reached."""
+    entry = await mock_add_config_entry()
+    coordinator: PitBossDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
+    coordinator.async_set_updated_data({"moduleIsOn": False})
+    await hass.async_block_till_done()
+
+    state = hass.states.get(_entity_id("MPC target reached"))
+    assert state is not None
+    assert state.state == "off"
