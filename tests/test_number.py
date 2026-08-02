@@ -4,6 +4,7 @@ from unittest.mock import Mock
 import pytest
 from conftest import get_entity
 from homeassistant.core import HomeAssistant
+from pytboss.exceptions import UnsupportedOperation
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.pitboss.const import DOMAIN
@@ -101,7 +102,7 @@ async def test_set_native_value(
         {"entity_id": "number.mygrill_mpc_target", "value": 180},
         blocking=True,
     )
-    mock_pitboss.set_probe_temperature.assert_awaited_once_with(180)
+    mock_pitboss.set_probe_target.assert_awaited_once_with(1, 180)
 
 
 @pytest.mark.parametrize("model", ["PBV4PS2"])
@@ -117,15 +118,14 @@ async def test_native_value_none_without_data(
 
 
 @pytest.mark.parametrize("model", ["PBV4PS2"])
-async def test_a_probe_without_a_command_goes_to_the_scratchpad(
+async def test_setting_a_target_goes_through_the_library(
     hass: HomeAssistant,
     mock_add_config_entry: Callable[[], Awaitable[MockConfigEntry]],
     mock_pitboss: Mock,
 ) -> None:
-    """P2 has no board command here, so its target is written to vData."""
+    """Which route a probe takes is pytboss's business, not ours."""
     entry = await mock_add_config_entry()
     coordinator: PitBossDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
-    coordinator.virtual_data = {"p1T": 200, "psw": "secret"}
     coordinator.async_set_updated_data({"moduleIsOn": True, "isFahrenheit": True})
     await hass.async_block_till_done()
 
@@ -136,48 +136,22 @@ async def test_a_probe_without_a_command_goes_to_the_scratchpad(
         blocking=True,
     )
 
-    # The firmware assigns the payload wholesale, so untouched keys have to be
-    # sent back -- and `psw` must not be stored as data.
-    mock_pitboss.set_virtual_data.assert_awaited_once_with({"p1T": 200, "p2T": 165})
-    mock_pitboss.set_probe_2_temperature.assert_not_awaited()
+    mock_pitboss.set_probe_target.assert_awaited_once_with(2, 165)
     state = hass.states.get("number.mygrill_p2_target")
     assert state is not None
     assert state.state == "165"
 
 
 @pytest.mark.parametrize("model", ["PBV4PS2"])
-async def test_the_scratchpad_is_written_in_fahrenheit(
+async def test_a_target_set_while_off_is_kept(
     hass: HomeAssistant,
     mock_add_config_entry: Callable[[], Awaitable[MockConfigEntry]],
     mock_pitboss: Mock,
 ) -> None:
-    """vData is always Fahrenheit, whatever unit the grill is working in.
-
-    Driven through the coordinator rather than the entity: Home Assistant
-    fixes an entity's display unit when it is registered, so going through the
-    service would measure its conversion on top of ours.
-    """
+    """The grill's store rejects writes while it is off."""
     entry = await mock_add_config_entry()
     coordinator: PitBossDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
-    coordinator.async_set_updated_data({"moduleIsOn": True, "isFahrenheit": False})
-    await hass.async_block_till_done()
-
-    await coordinator.async_set_probe_target(2, 74)
-
-    mock_pitboss.set_virtual_data.assert_awaited_once_with({"p2T": 165})
-    # ...and reads back in the grill's unit rather than as 165.
-    assert coordinator.probe_target(2) == 74
-
-
-@pytest.mark.parametrize("model", ["PBV4PS2"])
-async def test_a_target_set_while_off_is_kept_not_written(
-    hass: HomeAssistant,
-    mock_add_config_entry: Callable[[], Awaitable[MockConfigEntry]],
-    mock_pitboss: Mock,
-) -> None:
-    """The scratchpad only accepts writes while the grill is on."""
-    entry = await mock_add_config_entry()
-    coordinator: PitBossDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
+    mock_pitboss.set_probe_target.side_effect = UnsupportedOperation
     coordinator.async_set_updated_data({"moduleIsOn": False, "isFahrenheit": True})
     await hass.async_block_till_done()
 
@@ -188,30 +162,11 @@ async def test_a_target_set_while_off_is_kept_not_written(
         blocking=True,
     )
 
-    mock_pitboss.set_virtual_data.assert_not_awaited()
     # Still shown, so the user sees what will be sent at power-on.
     state = hass.states.get("number.mygrill_p2_target")
     assert state is not None
     assert state.state == "165"
-
-
-@pytest.mark.parametrize("model", ["PBV4PS2"])
-async def test_a_reported_target_wins_over_the_scratchpad(
-    hass: HomeAssistant,
-    mock_add_config_entry: Callable[[], Awaitable[MockConfigEntry]],
-) -> None:
-    """The board reports `p1Target` itself; vData must not override it."""
-    entry = await mock_add_config_entry()
-    coordinator: PitBossDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
-    coordinator.virtual_data = {"p1T": 200}
-    coordinator.async_set_updated_data(
-        {"p1Target": 165, "moduleIsOn": True, "isFahrenheit": True}
-    )
-    await hass.async_block_till_done()
-
-    state = hass.states.get("number.mygrill_mpc_target")
-    assert state is not None
-    assert state.state == "165"
+    assert coordinator.restored_targets[2] == 165
 
 
 @pytest.mark.parametrize("model", ["PBV4PS2"])
@@ -223,50 +178,59 @@ async def test_a_target_set_while_off_is_written_at_power_on(
     """What makes setting a target on a cold grill mean anything."""
     entry = await mock_add_config_entry()
     coordinator: PitBossDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
+    mock_pitboss.set_probe_target.side_effect = UnsupportedOperation
     coordinator.async_set_updated_data({"moduleIsOn": False, "isFahrenheit": True})
     await coordinator.async_set_probe_target(2, 165)
-    mock_pitboss.set_virtual_data.assert_not_awaited()
 
-    await coordinator._async_refresh_virtual_data({"moduleIsOn": True})
+    mock_pitboss.set_probe_target.side_effect = None
+    mock_pitboss.get_probe_targets.return_value = {}
+    await coordinator._async_refresh_probe_targets({"moduleIsOn": True})
 
-    mock_pitboss.set_virtual_data.assert_awaited_once_with({"p2T": 165})
+    mock_pitboss.set_probe_target.assert_awaited_with(2, 165)
 
 
 @pytest.mark.parametrize("model", ["PBV4PS2"])
-async def test_the_scratchpad_is_seeded_only_once_per_power_cycle(
+async def test_targets_are_seeded_only_once_per_power_cycle(
     hass: HomeAssistant,
     mock_add_config_entry: Callable[[], Awaitable[MockConfigEntry]],
     mock_pitboss: Mock,
 ) -> None:
     entry = await mock_add_config_entry()
     coordinator: PitBossDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
+    mock_pitboss.set_probe_target.side_effect = UnsupportedOperation
     coordinator.async_set_updated_data({"moduleIsOn": False, "isFahrenheit": True})
     await coordinator.async_set_probe_target(2, 165)
+    mock_pitboss.set_probe_target.side_effect = None
+    mock_pitboss.set_probe_target.reset_mock()
+    mock_pitboss.get_probe_targets.return_value = {}
 
     for _ in range(3):
-        await coordinator._async_refresh_virtual_data({"moduleIsOn": True})
-    assert mock_pitboss.set_virtual_data.await_count == 1
+        await coordinator._async_refresh_probe_targets({"moduleIsOn": True})
+    assert mock_pitboss.set_probe_target.await_count == 1
 
-    # Power cycle: the firmware wipes it, so it has to be seeded again.
-    await coordinator._async_refresh_virtual_data({"moduleIsOn": False})
-    await coordinator._async_refresh_virtual_data({"moduleIsOn": True})
-    assert mock_pitboss.set_virtual_data.await_count == 2
+    # Power cycle: the grill's store is wiped, so it has to be seeded again.
+    await coordinator._async_refresh_probe_targets({"moduleIsOn": False})
+    await coordinator._async_refresh_probe_targets({"moduleIsOn": True})
+    assert mock_pitboss.set_probe_target.await_count == 2
 
 
 @pytest.mark.parametrize("model", ["PBV4PS2"])
-async def test_a_target_already_in_the_scratchpad_is_not_overwritten(
+async def test_a_target_the_grill_already_has_is_not_overwritten(
     hass: HomeAssistant,
     mock_add_config_entry: Callable[[], Awaitable[MockConfigEntry]],
     mock_pitboss: Mock,
 ) -> None:
-    """One set from the vendor's app wins over the one we are holding."""
+    """One set elsewhere wins over the one we are holding."""
     entry = await mock_add_config_entry()
     coordinator: PitBossDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
+    mock_pitboss.set_probe_target.side_effect = UnsupportedOperation
     coordinator.async_set_updated_data({"moduleIsOn": False, "isFahrenheit": True})
     await coordinator.async_set_probe_target(2, 165)
-    mock_pitboss.get_virtual_data.return_value = {"p2T": 190}
+    mock_pitboss.set_probe_target.side_effect = None
+    mock_pitboss.set_probe_target.reset_mock()
+    mock_pitboss.get_probe_targets.return_value = {2: 190}
 
-    await coordinator._async_refresh_virtual_data({"moduleIsOn": True})
+    await coordinator._async_refresh_probe_targets({"moduleIsOn": True})
 
-    mock_pitboss.set_virtual_data.assert_not_awaited()
+    mock_pitboss.set_probe_target.assert_not_awaited()
     assert coordinator.probe_target(2) == 190

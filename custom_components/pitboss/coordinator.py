@@ -8,9 +8,13 @@ from homeassistant.const import UnitOfTemperature
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
-from homeassistant.util.unit_conversion import TemperatureConverter
 from pytboss.api import PitBoss
-from pytboss.exceptions import GrillUnavailable, NotConnectedError, RPCError
+from pytboss.exceptions import (
+    GrillUnavailable,
+    NotConnectedError,
+    RPCError,
+    UnsupportedOperation,
+)
 from pytboss.grills import StateDict
 
 from .const import DOMAIN, LOGGER, PING_INTERVAL, SYS_INFO_INTERVAL
@@ -40,11 +44,11 @@ class PitBossDataUpdateCoordinator(DataUpdateCoordinator[StateDict]):
         # Latest Sys.GetInfo payload from the control board.
         self.sys_info: dict = {}
         self._sys_info_at = 0.0
-        # The grill's scratchpad, and our own copy of the targets we set
-        # through it. See `async_set_probe_target`.
-        self.virtual_data: dict = {}
+        # What the grill is holding, and what we are holding for it. See
+        # `probe_target` for why both exist.
         self.probe_targets: dict[int, int] = {}
-        self._vdata_seeded = False
+        self.restored_targets: dict[int, int] = {}
+        self._targets_seeded = False
 
     def accepted_setpoints(self, unit: str) -> list[float]:
         """Grill setpoints the control board honours, expressed in `unit`.
@@ -75,124 +79,61 @@ class PitBossDataUpdateCoordinator(DataUpdateCoordinator[StateDict]):
             return UnitOfTemperature.CELSIUS
         return UnitOfTemperature.FAHRENHEIT
 
-    def probe_command_slug(self, probe_number: int) -> str | None:
-        """The board command that sets this probe's target, when it exists.
-
-        No board in the catalogue declares one for probes 3 or 4, and only 42
-        of 137 declare one for probe 1, so most probes have no command route
-        at all.
-        """
-        slug = f"set-probe-{probe_number}-temperature"
-        if slug in self.api.spec.control_board.commands:
-            return slug
-        return None
-
     def probe_target(self, probe_number: int) -> int | None:
         """This probe's target, in the grill's own unit.
 
-        The board reports a target of its own only for the control probe --
-        `p1Target` on every model, `p2Target` on 26 of them -- so for the rest
-        the scratchpad, and failing that our own copy, is the only source.
+        Board-reported first: `pNTarget` is already in the state we hold, so
+        reading it here means a target the grill announces shows immediately
+        rather than at the next poll. Then what pytboss resolved from the
+        grill's store. Then ours -- a target we set and restored across a
+        restart, which exists only because Home Assistant outlives that store.
         """
-        if (data := self.data) is not None:
-            reported = data.get(f"p{probe_number}Target")
-            if isinstance(reported, (int, float)):
-                return int(reported)
-        raw = self.virtual_data.get(f"p{probe_number}T")
-        if raw is not None:
-            return round(self.temperature_from_fahrenheit(raw))
-        return self.probe_targets.get(probe_number)
-
-    def temperature_from_fahrenheit(self, value: float) -> float:
-        """Convert a scratchpad temperature into the grill's own unit."""
-        if self.grill_unit == UnitOfTemperature.FAHRENHEIT:
-            return float(value)
-        return TemperatureConverter.convert(
-            float(value), UnitOfTemperature.FAHRENHEIT, UnitOfTemperature.CELSIUS
-        )
-
-    def temperature_to_fahrenheit(self, value: float) -> int:
-        """Convert a grill-unit temperature into what the scratchpad wants."""
-        if self.grill_unit == UnitOfTemperature.FAHRENHEIT:
-            return round(value)
-        return round(
-            TemperatureConverter.convert(
-                value, UnitOfTemperature.CELSIUS, UnitOfTemperature.FAHRENHEIT
-            )
-        )
-
-    async def _async_write_virtual_data(self, updates: dict) -> None:
-        """Merge `updates` into the grill's scratchpad.
-
-        The firmware assigns the payload wholesale (`vData = params`), so
-        anything not sent back is lost -- the vendor's app merges client-side
-        too. `psw` is dropped because authentication injects it into the same
-        object and it would otherwise be stored as data.
-        """
-        payload = {k: v for k, v in self.virtual_data.items() if k != "psw"}
-        payload.update(updates)
-        await self.api.set_virtual_data(payload)
-        self.virtual_data = payload
+        reported = (self.data or {}).get(f"p{probe_number}Target")
+        if isinstance(reported, (int, float)):
+            return int(reported)
+        if (target := self.probe_targets.get(probe_number)) is not None:
+            return target
+        return self.restored_targets.get(probe_number)
 
     async def async_set_probe_target(self, probe_number: int, temp: int) -> None:
-        """Set a probe's target, by whichever route the grill supports."""
-        if self.probe_command_slug(probe_number) is not None:
-            if probe_number == 1:
-                await self.api.set_probe_temperature(temp)
-            else:
-                await self.api.set_probe_2_temperature(temp)
-        elif (data := self.data) and data.get("moduleIsOn"):
-            # The scratchpad only accepts writes while the grill is on; when
-            # it is not, the value stays with us and is written at power-on.
-            await self._async_write_virtual_data(
-                {f"p{probe_number}T": self.temperature_to_fahrenheit(temp)}
-            )
+        """Set a probe's target, keeping it if the grill cannot take it yet."""
+        self.restored_targets[probe_number] = temp
+        try:
+            await self.api.set_probe_target(probe_number, temp)
+        except UnsupportedOperation:
+            # The grill is off: its store rejects writes and is wiped anyway.
+            # Held here and written when it comes on.
+            return
         self.probe_targets[probe_number] = temp
 
-    async def _async_refresh_virtual_data(self, state: StateDict) -> None:
-        """Track the grill's scratchpad. Never fatal."""
+    async def _async_refresh_probe_targets(self, state: StateDict) -> None:
+        """Track the targets the grill is holding. Never fatal."""
         if not state.get("moduleIsOn"):
-            # The firmware clears it on every status frame while off.
-            self.virtual_data = {}
-            self._vdata_seeded = False
+            self.probe_targets = {}
+            self._targets_seeded = False
             return
         try:
-            data = await self.api.get_virtual_data()
+            # Copied: we add to this below, and it is not ours to mutate.
+            self.probe_targets = dict(await self.api.get_probe_targets())
         except Exception as ex:  # noqa: BLE001
-            self.logger.debug("Could not fetch the virtual data: %s", ex)
+            self.logger.debug("Could not fetch the probe targets: %s", ex)
             return
-        self.virtual_data = data if isinstance(data, dict) else {}
-        # Adopt whatever the scratchpad holds as our own last-known value, so a
-        # target set from the vendor's app does not snap back to ours when the
-        # grill goes off and the firmware wipes the scratchpad.
-        for number in range(1, (self.api.spec.meat_probes or 1) + 1):
-            if self.probe_command_slug(number) is not None:
+        if self._targets_seeded:
+            return
+        self._targets_seeded = True
+        # The grill has just come on, so anything we are holding that it does
+        # not know about goes over now. That is what makes setting a target on
+        # a cold grill mean anything. A target the grill already has was set
+        # elsewhere and wins.
+        for probe_number, temp in self.restored_targets.items():
+            if probe_number in self.probe_targets:
                 continue
-            raw = self.virtual_data.get(f"p{number}T")
-            if raw is not None:
-                self.probe_targets[number] = round(
-                    self.temperature_from_fahrenheit(raw)
-                )
-
-        if self._vdata_seeded:
-            return
-        self._vdata_seeded = True
-        # The grill has just come on with an empty scratchpad. Hand it the
-        # targets we are holding, which is what makes setting one while the
-        # grill is off mean anything. A value already there was set from the
-        # vendor's app and wins.
-        updates = {
-            f"p{number}T": self.temperature_to_fahrenheit(temp)
-            for number, temp in self.probe_targets.items()
-            if self.probe_command_slug(number) is None
-            and f"p{number}T" not in self.virtual_data
-        }
-        if not updates:
-            return
-        try:
-            await self._async_write_virtual_data(updates)
-        except Exception as ex:  # noqa: BLE001
-            self.logger.debug("Could not seed the virtual data: %s", ex)
+            try:
+                await self.api.set_probe_target(probe_number, temp)
+            except Exception as ex:  # noqa: BLE001
+                self.logger.debug("Could not seed a probe target: %s", ex)
+            else:
+                self.probe_targets[probe_number] = temp
 
     async def _async_setup(self) -> None:
         """Set up the coordinator."""
@@ -274,7 +215,7 @@ class PitBossDataUpdateCoordinator(DataUpdateCoordinator[StateDict]):
         # a reconnect if push notifications stop being delivered.
         try:
             state = self._merge_state(await self.api.get_state())
-            await self._async_refresh_virtual_data(state)
+            await self._async_refresh_probe_targets(state)
             return state
         except NotConnectedError as ex:
             raise UpdateFailed("Grill not connected") from ex

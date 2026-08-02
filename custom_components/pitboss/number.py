@@ -73,10 +73,9 @@ class TargetProbeTemperature(BaseEntity, RestoreNumber):
     async def async_added_to_hass(self) -> None:
         """Restore the target we last set for this probe.
 
-        Targets that live in the scratchpad are wiped by the firmware when the
-        grill is switched off, and the ones we hold for probes the grill knows
-        nothing about would otherwise be forgotten on restart. Anything the
-        grill or the scratchpad reports wins over the restored value.
+        The grill's own store is wiped when it is switched off, so without
+        this a target set on a cold grill would not survive a Home Assistant
+        restart. Anything the grill is holding wins over the restored value.
         """
         await super().async_added_to_hass()
         probe_number = self.entity_description.probe_number
@@ -93,7 +92,7 @@ class TargetProbeTemperature(BaseEntity, RestoreNumber):
             value = TemperatureConverter.convert(
                 value, stored_unit, self.coordinator.grill_unit
             )
-        self.coordinator.probe_targets[probe_number] = round(value)
+        self.coordinator.restored_targets[probe_number] = round(value)
 
     @property
     def native_unit_of_measurement(self) -> str:
